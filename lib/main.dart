@@ -4,6 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:webview_flutter_android/webview_flutter_android.dart';
+import 'package:image_cropper/image_cropper.dart';
 import 'firebase_options.dart';
 
 const String appUrl = 'https://d1zjrqrmxapuvq.cloudfront.net';
@@ -31,6 +34,7 @@ class _SocietyAppState extends State<SocietyApp> {
   late final WebViewController webViewController;
   bool isLoading = true;
   String? fcmToken;
+  final ImagePicker _imagePicker = ImagePicker();
 
   @override
   void initState() {
@@ -50,8 +54,59 @@ class _SocietyAppState extends State<SocietyApp> {
         ),
       )
       ..loadRequest(Uri.parse(appUrl));
-
+    setupFilePicker();
     setupNotifications();
+  }
+
+  Future<void> setupFilePicker() async {
+    final androidController =
+        webViewController.platform as AndroidWebViewController;
+
+    await androidController.setOnShowFileSelector((params) async {
+      // 1. Pick from gallery
+      final XFile? pickedImage = await _imagePicker.pickImage(
+        source: ImageSource.gallery,
+      );
+
+      if (pickedImage == null) {
+        return <String>[];
+      }
+
+      // 2. Open native crop screen
+      final CroppedFile? croppedImage =
+          await ImageCropper().cropImage(
+        sourcePath: pickedImage.path,
+        maxWidth: 1920,
+        maxHeight: 1920,
+        compressFormat: ImageCompressFormat.jpg,
+        compressQuality: 85,
+        uiSettings: [
+          AndroidUiSettings(
+            toolbarTitle: 'Adjust photo',
+            initAspectRatio: CropAspectRatioPreset.original,
+            lockAspectRatio: false,
+            hideBottomControls: false,
+            showCropGrid: true,
+          ),
+        ],
+      );
+
+      // 3. User cancelled cropping
+      if (croppedImage == null) {
+        return <String>[];
+      }
+
+      // 4. Return cropped file to the HTML input in WebView
+      return <String>[
+        Uri.file(croppedImage.path).toString(),
+      ];
+    });
+  }
+
+  Future<void> handleBack() async {
+    if (await webViewController.canGoBack()) {
+      await webViewController.goBack();
+    }
   }
 
   Future<void> setupNotifications() async {
@@ -131,17 +186,24 @@ class _SocietyAppState extends State<SocietyApp> {
     }
   }
 
-  @override
+ @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      home: Scaffold(
-        body: SafeArea(
-          child: Stack(
-            children: [
-              WebViewWidget(controller: webViewController),
-              if (isLoading) const LinearProgressIndicator(),
-            ],
+      home: PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, result) async {
+          if (didPop) return;
+          await handleBack();
+        },
+        child: Scaffold(
+          body: SafeArea(
+            child: Stack(
+              children: [
+                WebViewWidget(controller: webViewController),
+                if (isLoading) const LinearProgressIndicator(),
+              ],
+            ),
           ),
         ),
       ),
