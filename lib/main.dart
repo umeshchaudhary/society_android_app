@@ -35,6 +35,7 @@ class _SocietyAppState extends State<SocietyApp> {
   bool isLoading = true;
   String? fcmToken;
   final ImagePicker _imagePicker = ImagePicker();
+  String? pendingNotificationPath;
 
   @override
   void initState() {
@@ -50,12 +51,51 @@ class _SocietyAppState extends State<SocietyApp> {
           onPageFinished: (_) {
             if (mounted) setState(() => isLoading = false);
             registerTokenInWebView();
+            navigateToPendingNotification();
           },
         ),
       )
       ..loadRequest(Uri.parse(appUrl));
     setupFilePicker();
     setupNotifications();
+    FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+      openNotificationDestination(message);
+    });
+
+    checkInitialNotification();
+  }
+
+  Future<void> checkInitialNotification() async {
+    // Handles a notification tap that launched the app from a terminated state.
+    final message = await FirebaseMessaging.instance.getInitialMessage();
+
+    if (message != null) {
+      openNotificationDestination(message);
+    }
+  }
+
+  void openNotificationDestination(RemoteMessage message) {
+    // Prefer a destination sent in the push data.
+    final path = message.data['path'] as String? ?? '/';
+
+    // Accept only internal site paths, not arbitrary URLs.
+    if (!path.startsWith('/') || path.startsWith('//')) return;
+
+    pendingNotificationPath = path;
+    navigateToPendingNotification();
+  }
+
+  Future<void> navigateToPendingNotification() async {
+    final path = pendingNotificationPath;
+    if (path == null) return;
+
+    // Keep the destination pending until the WebView has a page loaded.
+    if (!mounted) return;
+
+    pendingNotificationPath = null;
+    await webViewController.loadRequest(
+      Uri.parse('https://d1zjrqrmxapuvq.cloudfront.net$path'),
+    );
   }
 
   Future<void> setupFilePicker() async {
