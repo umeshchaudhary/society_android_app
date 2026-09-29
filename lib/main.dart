@@ -1,5 +1,9 @@
-import 'dart:convert';
 
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -7,11 +11,79 @@ import 'package:webview_flutter/webview_flutter.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 import 'package:image_cropper/image_cropper.dart';
+import 'package:image/image.dart' as img;
+
 import 'firebase_options.dart';
 
-const String appUrl = 'https://d1zjrqrmxapuvq.cloudfront.net';
+const String appUrl = 'https://x3fwsiq3sbsyniks3wwlumhqqy0uggcr.lambda-url.ap-south-1.on.aws';
 const String registerTokenUrl =
-    'https://d1zjrqrmxapuvq.cloudfront.net/api/notifications/register';
+    'https://x3fwsiq3sbsyniks3wwlumhqqy0uggcr.lambda-url.ap-south-1.on.aws/api/notifications/register';
+
+const int maxImageBytes = 200 * 1024; // 200 KiB
+
+/// Runs in a background isolate. Returns JPEG bytes at or below 200 KiB.
+Uint8List _compressImageTo200KB(Uint8List inputBytes) {
+  final decoded = img.decodeImage(inputBytes);
+
+  if (decoded == null) {
+    throw Exception('Could not decode the cropped image.');
+  }
+
+  var working = decoded;
+
+  // Try reducing JPEG quality first, then shrink the image and retry.
+  const qualities = [82, 75, 68, 60, 52, 45, 38, 32];
+
+  for (var resizeAttempt = 0; resizeAttempt < 12; resizeAttempt++) {
+    for (final quality in qualities) {
+      final encoded = img.encodeJpg(working, quality: quality);
+
+      if (encoded.length <= maxImageBytes) {
+        return Uint8List.fromList(encoded);
+      }
+    }
+
+    // Scale down while preserving the image's aspect ratio.
+    final newWidth = (working.width * 0.8).round();
+    if (newWidth < 320 || newWidth >= working.width) {
+      break;
+    }
+
+    working = img.copyResize(
+      working,
+      width: newWidth,
+      interpolation: img.Interpolation.average,
+    );
+  }
+
+  throw Exception(
+    'Unable to compress the cropped image below 200 KB. '
+    'Please try cropping a smaller area.',
+  );
+}
+
+Future<File> compressCroppedImage(String croppedPath) async {
+  final sourceBytes = await File(croppedPath).readAsBytes();
+
+  // Offload image decoding/resizing/encoding so the UI stays responsive.
+  final compressedBytes = await compute(
+    _compressImageTo200KB,
+    sourceBytes,
+  );
+
+  if (compressedBytes.length > maxImageBytes) {
+    throw Exception('Compressed image exceeds the 200 KB limit.');
+  }
+
+  final outputPath =
+      '${Directory.systemTemp.path}/society_crop_'
+      '${DateTime.now().microsecondsSinceEpoch}.jpg';
+
+  final outputFile = File(outputPath);
+  await outputFile.writeAsBytes(compressedBytes, flush: true);
+
+  return outputFile;
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -34,6 +106,7 @@ class _SocietyAppState extends State<SocietyApp> {
   late final WebViewController webViewController;
   bool isLoading = true;
   String? fcmToken;
+
   final ImagePicker _imagePicker = ImagePicker();
   String? pendingNotificationPath;
 
@@ -56,8 +129,10 @@ class _SocietyAppState extends State<SocietyApp> {
         ),
       )
       ..loadRequest(Uri.parse(appUrl));
+
     setupFilePicker();
     setupNotifications();
+
     FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
       openNotificationDestination(message);
     });
@@ -66,7 +141,6 @@ class _SocietyAppState extends State<SocietyApp> {
   }
 
   Future<void> checkInitialNotification() async {
-    // Handles a notification tap that launched the app from a terminated state.
     final message = await FirebaseMessaging.instance.getInitialMessage();
 
     if (message != null) {
@@ -75,7 +149,6 @@ class _SocietyAppState extends State<SocietyApp> {
   }
 
   void openNotificationDestination(RemoteMessage message) {
-    // Prefer a destination sent in the push data.
     final path = message.data['path'] as String? ?? '/';
 
     // Accept only internal site paths, not arbitrary URLs.
@@ -87,14 +160,12 @@ class _SocietyAppState extends State<SocietyApp> {
 
   Future<void> navigateToPendingNotification() async {
     final path = pendingNotificationPath;
-    if (path == null) return;
-
-    // Keep the destination pending until the WebView has a page loaded.
-    if (!mounted) return;
+    if (path == null || !mounted) return;
 
     pendingNotificationPath = null;
+
     await webViewController.loadRequest(
-      Uri.parse('https://d1zjrqrmxapuvq.cloudfront.net$path'),
+      Uri.parse('$appUrl$path'),
     );
   }
 
@@ -103,43 +174,58 @@ class _SocietyAppState extends State<SocietyApp> {
         webViewController.platform as AndroidWebViewController;
 
     await androidController.setOnShowFileSelector((params) async {
-      // 1. Pick from gallery
-      final XFile? pickedImage = await _imagePicker.pickImage(
-        source: ImageSource.gallery,
-      );
+      try {
+        // 1. Pick an image from the gallery.
+        final XFile? pickedImage = await _imagePicker.pickImage(
+          source: ImageSource.gallery,
+        );
 
-      if (pickedImage == null) {
+        if (pickedImage == null) {
+          return <String>[];
+        }
+
+        // 2. Open the native Android uCrop screen.
+        final CroppedFile? croppedImage = await ImageCropper().cropImage(
+          sourcePath: pickedImage.path,
+          maxWidth: 1920,
+          maxHeight: 1920,
+          compressFormat: ImageCompressFormat.jpg,
+          compressQuality: 85,
+          uiSettings: [
+            AndroidUiSettings(
+              toolbarTitle: 'Adjust photo',
+              initAspectRatio: CropAspectRatioPreset.original,
+              lockAspectRatio: false,
+              hideBottomControls: false,
+              showCropGrid: true,
+            ),
+          ],
+        );
+
+        // 3. User cancelled cropping.
+        if (croppedImage == null) {
+          return <String>[];
+        }
+
+        // 4. Recompress/resize the cropped result to max 200 KiB.
+        final File finalImage = await compressCroppedImage(
+          croppedImage.path,
+        );
+
+        debugPrint(
+          'Cropped upload image size: '
+          '${(await finalImage.length() / 1024).toStringAsFixed(1)} KB',
+        );
+
+        // 5. Return the final compressed file to the WebView input.
+        return <String>[
+          Uri.file(finalImage.path).toString(),
+        ];
+      } catch (error, stackTrace) {
+        debugPrint('Image pick/crop/compress failed: $error');
+        debugPrintStack(stackTrace: stackTrace);
         return <String>[];
       }
-
-      // 2. Open native crop screen
-      final CroppedFile? croppedImage =
-          await ImageCropper().cropImage(
-        sourcePath: pickedImage.path,
-        maxWidth: 1920,
-        maxHeight: 1920,
-        compressFormat: ImageCompressFormat.jpg,
-        compressQuality: 85,
-        uiSettings: [
-          AndroidUiSettings(
-            toolbarTitle: 'Adjust photo',
-            initAspectRatio: CropAspectRatioPreset.original,
-            lockAspectRatio: false,
-            hideBottomControls: false,
-            showCropGrid: true,
-          ),
-        ],
-      );
-
-      // 3. User cancelled cropping
-      if (croppedImage == null) {
-        return <String>[];
-      }
-
-      // 4. Return cropped file to the HTML input in WebView
-      return <String>[
-        Uri.file(croppedImage.path).toString(),
-      ];
     });
   }
 
@@ -159,6 +245,7 @@ class _SocietyAppState extends State<SocietyApp> {
     );
 
     final token = await messaging.getToken();
+
     if (token != null) {
       fcmToken = token;
       debugPrint('FCM token obtained');
@@ -182,6 +269,7 @@ class _SocietyAppState extends State<SocietyApp> {
     });
 
     final initialMessage = await messaging.getInitialMessage();
+
     if (initialMessage != null) {
       debugPrint('App opened from notification: ${initialMessage.data}');
     }
@@ -191,7 +279,6 @@ class _SocietyAppState extends State<SocietyApp> {
     final token = fcmToken;
     if (token == null) return;
 
-    // Safely encode the token as a JavaScript string literal.
     final tokenJson = jsonEncode(token);
 
     final script = '''
@@ -226,7 +313,7 @@ class _SocietyAppState extends State<SocietyApp> {
     }
   }
 
- @override
+  @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
