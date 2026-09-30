@@ -1,17 +1,11 @@
-
 import 'dart:convert';
-import 'dart:io';
-import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:webview_flutter/webview_flutter.dart';
-import 'package:image_picker/image_picker.dart';
+import 'package:file_selector/file_selector.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
-import 'package:image_cropper/image_cropper.dart';
-import 'package:image/image.dart' as img;
 
 import 'firebase_options.dart';
 
@@ -19,71 +13,6 @@ const String appUrl = 'https://x3fwsiq3sbsyniks3wwlumhqqy0uggcr.lambda-url.ap-so
 const String registerTokenUrl =
     'https://x3fwsiq3sbsyniks3wwlumhqqy0uggcr.lambda-url.ap-south-1.on.aws/api/notifications/register';
 
-const int maxImageBytes = 200 * 1024; // 200 KiB
-
-/// Runs in a background isolate. Returns JPEG bytes at or below 200 KiB.
-Uint8List _compressImageTo200KB(Uint8List inputBytes) {
-  final decoded = img.decodeImage(inputBytes);
-
-  if (decoded == null) {
-    throw Exception('Could not decode the cropped image.');
-  }
-
-  var working = decoded;
-
-  // Try reducing JPEG quality first, then shrink the image and retry.
-  const qualities = [82, 75, 68, 60, 52, 45, 38, 32];
-
-  for (var resizeAttempt = 0; resizeAttempt < 12; resizeAttempt++) {
-    for (final quality in qualities) {
-      final encoded = img.encodeJpg(working, quality: quality);
-
-      if (encoded.length <= maxImageBytes) {
-        return Uint8List.fromList(encoded);
-      }
-    }
-
-    // Scale down while preserving the image's aspect ratio.
-    final newWidth = (working.width * 0.8).round();
-    if (newWidth < 320 || newWidth >= working.width) {
-      break;
-    }
-
-    working = img.copyResize(
-      working,
-      width: newWidth,
-      interpolation: img.Interpolation.average,
-    );
-  }
-
-  throw Exception(
-    'Unable to compress the cropped image below 200 KB. '
-    'Please try cropping a smaller area.',
-  );
-}
-
-Future<File> compressCroppedImage(String croppedPath) async {
-  final sourceBytes = await File(croppedPath).readAsBytes();
-
-  // Offload image decoding/resizing/encoding so the UI stays responsive.
-  final compressedBytes = await compute(
-    _compressImageTo200KB,
-    sourceBytes,
-  );
-
-  if (compressedBytes.length > maxImageBytes) {
-    throw Exception('Compressed image exceeds the 200 KB limit.');
-  }
-
-  final outputPath =
-      '${Directory.systemTemp.path}/society_crop_'
-      '${DateTime.now().microsecondsSinceEpoch}.jpg';
-
-  final outputFile = File(outputPath);
-  await outputFile.writeAsBytes(compressedBytes, flush: true);
-
-  return outputFile;
-}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -105,9 +34,11 @@ class SocietyApp extends StatefulWidget {
 class _SocietyAppState extends State<SocietyApp> {
   late final WebViewController webViewController;
   bool isLoading = true;
+  bool hasServerError = false;
   String? fcmToken;
+  bool tokenRegistered = false;
+  bool registering = false;
 
-  final ImagePicker _imagePicker = ImagePicker();
   String? pendingNotificationPath;
 
   @override
@@ -116,22 +47,61 @@ class _SocietyAppState extends State<SocietyApp> {
 
     webViewController = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..addJavaScriptChannel(
+        'FcmBridge',
+        onMessageReceived: (msg) {
+          registering = false;
+          if (msg.message == 'ok') {
+            tokenRegistered = true;
+            debugPrint('FCM device token registered');
+          } else {
+            debugPrint('FCM token registration failed, will retry');
+          }
+        },
+      )
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageStarted: (_) {
-            if (mounted) setState(() => isLoading = true);
+            if (mounted) {
+              setState(() {
+                isLoading = true;
+                hasServerError = false;
+              });
+            }
           },
           onPageFinished: (_) {
             if (mounted) setState(() => isLoading = false);
             registerTokenInWebView();
             navigateToPendingNotification();
           },
+          onHttpError: (error) {
+            final statusCode = error.response?.statusCode;
+
+            if (statusCode != null && statusCode >= 500 && statusCode <= 599) {
+              if (mounted) {
+                setState(() {
+                  isLoading = false;
+                  hasServerError = true;
+                });
+              }
+            }
+          },
+          onWebResourceError: (error) {
+            if (error.isForMainFrame == true) {
+              if (mounted) {
+                setState(() {
+                  isLoading = false;
+                  hasServerError = true;
+                });
+              }
+            }
+          },
         ),
       )
       ..loadRequest(Uri.parse(appUrl));
 
-    setupFilePicker();
     setupNotifications();
+    setupFilePicker();
 
     FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
       openNotificationDestination(message);
@@ -169,65 +139,6 @@ class _SocietyAppState extends State<SocietyApp> {
     );
   }
 
-  Future<void> setupFilePicker() async {
-    final androidController =
-        webViewController.platform as AndroidWebViewController;
-
-    await androidController.setOnShowFileSelector((params) async {
-      try {
-        // 1. Pick an image from the gallery.
-        final XFile? pickedImage = await _imagePicker.pickImage(
-          source: ImageSource.gallery,
-        );
-
-        if (pickedImage == null) {
-          return <String>[];
-        }
-
-        // 2. Open the native Android uCrop screen.
-        final CroppedFile? croppedImage = await ImageCropper().cropImage(
-          sourcePath: pickedImage.path,
-          maxWidth: 1920,
-          maxHeight: 1920,
-          compressFormat: ImageCompressFormat.jpg,
-          compressQuality: 85,
-          uiSettings: [
-            AndroidUiSettings(
-              toolbarTitle: 'Adjust photo',
-              initAspectRatio: CropAspectRatioPreset.original,
-              lockAspectRatio: false,
-              hideBottomControls: false,
-              showCropGrid: true,
-            ),
-          ],
-        );
-
-        // 3. User cancelled cropping.
-        if (croppedImage == null) {
-          return <String>[];
-        }
-
-        // 4. Recompress/resize the cropped result to max 200 KiB.
-        final File finalImage = await compressCroppedImage(
-          croppedImage.path,
-        );
-
-        debugPrint(
-          'Cropped upload image size: '
-          '${(await finalImage.length() / 1024).toStringAsFixed(1)} KB',
-        );
-
-        // 5. Return the final compressed file to the WebView input.
-        return <String>[
-          Uri.file(finalImage.path).toString(),
-        ];
-      } catch (error, stackTrace) {
-        debugPrint('Image pick/crop/compress failed: $error');
-        debugPrintStack(stackTrace: stackTrace);
-        return <String>[];
-      }
-    });
-  }
 
   Future<void> handleBack() async {
     if (await webViewController.canGoBack()) {
@@ -254,6 +165,7 @@ class _SocietyAppState extends State<SocietyApp> {
 
     messaging.onTokenRefresh.listen((newToken) {
       fcmToken = newToken;
+      tokenRegistered = false;
       debugPrint('FCM token refreshed');
       registerTokenInWebView();
     });
@@ -263,22 +175,43 @@ class _SocietyAppState extends State<SocietyApp> {
         'Notification received: ${message.notification?.title}',
       );
     });
+  }
 
-    FirebaseMessaging.onMessageOpenedApp.listen((message) {
-      debugPrint('Notification tapped: ${message.data}');
+  Future<void> setupFilePicker() async {
+    final androidController =
+        webViewController.platform as AndroidWebViewController;
+
+    await androidController.setOnShowFileSelector((params) async {
+      try {
+        final file = await openFile(
+          acceptedTypeGroups: [
+            XTypeGroup(
+              label: 'Images',
+              extensions: ['jpg', 'jpeg', 'png', 'webp', 'heic'],
+            ),
+          ],
+        );
+
+        if (file == null) {
+          return <String>[];
+        }
+
+        return <String>[
+          Uri.file(file.path).toString(),
+        ];
+      } catch (error, stackTrace) {
+        debugPrint('File picker failed: $error');
+        debugPrintStack(stackTrace: stackTrace);
+        return <String>[];
+      }
     });
-
-    final initialMessage = await messaging.getInitialMessage();
-
-    if (initialMessage != null) {
-      debugPrint('App opened from notification: ${initialMessage.data}');
-    }
   }
 
   Future<void> registerTokenInWebView() async {
     final token = fcmToken;
-    if (token == null) return;
+    if (token == null || tokenRegistered || registering) return;
 
+    registering = true;
     final tokenJson = jsonEncode(token);
 
     final script = '''
@@ -294,13 +227,9 @@ class _SocietyAppState extends State<SocietyApp> {
             })
           });
 
-          if (response.ok) {
-            console.log('FCM device token registered');
-          } else {
-            console.log('FCM token registration status:', response.status);
-          }
+          FcmBridge.postMessage(response.ok ? 'ok' : 'fail');
         } catch (error) {
-          console.log('FCM token registration failed:', error);
+          FcmBridge.postMessage('fail');
         }
       })();
     ''';
@@ -309,8 +238,18 @@ class _SocietyAppState extends State<SocietyApp> {
       await webViewController.runJavaScript(script);
     } catch (error) {
       // The page may not be ready yet; onPageFinished will retry.
+      registering = false;
       debugPrint('Token registration deferred: $error');
     }
+  }
+
+  void retryConnection() {
+    setState(() {
+      hasServerError = false;
+      isLoading = true;
+    });
+
+    webViewController.loadRequest(Uri.parse(appUrl));
   }
 
   @override
@@ -325,12 +264,45 @@ class _SocietyAppState extends State<SocietyApp> {
         },
         child: Scaffold(
           body: SafeArea(
-            child: Stack(
-              children: [
-                WebViewWidget(controller: webViewController),
-                if (isLoading) const LinearProgressIndicator(),
-              ],
-            ),
+            child: hasServerError
+                ? Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Icon(
+                            Icons.cloud_off,
+                            size: 70,
+                          ),
+                          const SizedBox(height: 20),
+                          const Text(
+                            'Something went wrong',
+                            style: TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          const Text(
+                            'Unable to connect to SV Connect.\nPlease try again.',
+                            textAlign: TextAlign.center,
+                          ),
+                          const SizedBox(height: 24),
+                          ElevatedButton(
+                            onPressed: retryConnection,
+                            child: const Text('Try Again'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  )
+                : Stack(
+                    children: [
+                      WebViewWidget(controller: webViewController),
+                      if (isLoading) const LinearProgressIndicator(),
+                    ],
+                  ),
           ),
         ),
       ),

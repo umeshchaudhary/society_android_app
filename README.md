@@ -1,4 +1,4 @@
-# society_android_app
+# SV Connect
 
 A new Flutter project.
 
