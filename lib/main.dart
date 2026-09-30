@@ -6,6 +6,7 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'firebase_options.dart';
 
@@ -59,6 +60,12 @@ class _SocietyAppState extends State<SocietyApp> {
           }
         },
       )
+      ..addJavaScriptChannel(
+        'openUpiPaymentAndroid',
+        onMessageReceived: (message) {
+          openUpiPaymentAndroid(message.message);
+        },
+      )
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageStarted: (_) {
@@ -108,6 +115,19 @@ class _SocietyAppState extends State<SocietyApp> {
     });
 
     checkInitialNotification();
+  }
+
+  Future<void> openUpiPaymentAndroid(String upiUrl) async {
+    debugPrint('🔥 UPI BRIDGE RECEIVED: $upiUrl');
+
+    final uri = Uri.parse(upiUrl);
+
+    final launched = await launchUrl(
+      uri,
+      mode: LaunchMode.externalApplication,
+    );
+
+    debugPrint('UPI launched: $launched');
   }
 
   Future<void> checkInitialNotification() async {
